@@ -3183,6 +3183,8 @@ function a32_ops(f: (k: string) => string): string {
     "#define " + f(k)).join("\n");
 }
 
+const hip_h = fs.readFileSync(Bend.BEND_DIR + "/hip.h", "utf8");
+
 const runtime_c = (tabs: string, spins: string, segs: string,
   reqs: string): string => String.raw`
 
@@ -3194,8 +3196,11 @@ const runtime_c = (tabs: string, spins: string, segs: string,
 
 #pragma clang fp contract(off)
 
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(__HIPCC_RTC__)
 #define BEND_RTC 1
+#endif
+#ifdef __HIPCC_RTC__
+#pragma clang force_cuda_host_device begin
 #endif
 
 #ifdef __METAL_VERSION__
@@ -3229,8 +3234,12 @@ using namespace metal;
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
 #elif BEND_CUDA
+#if BEND_HIP
+${hip_h}
+#else
 #include <cuda.h>
 #include <nvrtc.h>
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -3273,6 +3282,10 @@ using namespace metal;
 #define CONSTV  static const
 #ifdef BEND_RTC
 #define OUTLINE static __attribute__((noinline))
+#ifdef __HIPCC_RTC__
+#undef CONSTV
+#define CONSTV  static __device__ const
+#endif
 #define DEVICE  1
 #define CLZ(x)  (u32)__clz((int)(x))
 #define FENCE() __threadfence()
@@ -4919,6 +4932,12 @@ static void gpu_pass(u32 f) {
 
 #elif BEND_CUDA
 
+#if BEND_HIP
+// an AMD consumer part without XNACK lacks managed access: the corpus
+// is then host memory the device maps
+static bool gpu_host;
+#endif
+
 static u64 gpu_hash(void) {
   u64 key = 14695981039346656037ull ^ CUBE_LOG;
   for (const char* p = BEND_SRC; *p != 0; p += 1) {
@@ -4938,12 +4957,21 @@ static const char* gpu_probe(void) {
   int managed = 0;
   CUcontext ctx;
   setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
+#if BEND_HIP
+  // XNACK on (an APU's default) hung the kernel on gfx902; off unless
+  // the user sets HSA_XNACK
+  setenv("HSA_XNACK", "0", 0);
+#endif
   GPU_CHECK(cuInit, 0);
   GPU_CHECK(cuDeviceGet, &gpu_dev, 0);
   GPU_CHECK(cuDeviceGetAttribute, &managed,
     CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, gpu_dev);
   if (managed == 0) {
+#if BEND_HIP
+    gpu_host = true;
+#else
     return "CUDA device lacks concurrent managed access (WSL2 lacks it)";
+#endif
   }
   int l2 = 1 << 23;
   cuDeviceGetAttribute(&l2, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, gpu_dev);
@@ -4970,6 +4998,15 @@ fail:;
 
 static u64* gpu_map(u64 bytes) {
   CUdeviceptr p = 0;
+#if BEND_HIP
+  if (gpu_host) {
+    if (hipHostMalloc((void**)&p, bytes,
+        hipHostMallocMapped | hipHostMallocCoherent) != CUDA_SUCCESS) {
+      err_fail("corpus reservation failed");
+    }
+    return (u64*)(uintptr_t)p;
+  }
+#endif
   if (cuMemAllocManaged(&p, bytes, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
     err_fail("corpus reservation failed");
   }
@@ -4983,22 +5020,32 @@ static u64* gpu_map(u64 bytes) {
 }
 
 static bool gpu_make(const char* path) {
+  char arch[64];
+  char bag[24];
+  int  nopts;
+#if BEND_HIP
+  hipDeviceProp_t prop;
+  hipGetDeviceProperties(&prop, gpu_dev);
+  snprintf(arch, sizeof arch, "--gpu-architecture=%s", prop.gcnArchName);
+  const char* opts[] = { arch, bag, "-ffp-contract=off" };
+  nopts = 3;
+#else
   int cc[2] = {0, 0};
   cuDeviceGetAttribute(cc,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, gpu_dev);
   cuDeviceGetAttribute(cc + 1,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, gpu_dev);
-  char arch[40];
-  char bag[24];
   snprintf(arch, sizeof arch, "--gpu-architecture=sm_%d%d", cc[0], cc[1]);
-  snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
   const char* opts[] = { arch, bag, "--fmad=false", "-default-device" };
+  nopts = 4;
+#endif
+  snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
   nvrtcProgram prog;
   if (nvrtcCreateProgram(&prog, BEND_SRC, "bend.cu", 0, NULL, NULL)
     != NVRTC_SUCCESS) {
     err_fail("cannot compile the CUDA library");
   }
-  if (nvrtcCompileProgram(prog, 4, opts) != NVRTC_SUCCESS) {
+  if (nvrtcCompileProgram(prog, nopts, opts) != NVRTC_SUCCESS) {
     size_t n = 0;
     nvrtcGetProgramLogSize(prog, &n);
     char* log = calloc(n + 1, 1);
@@ -5028,6 +5075,11 @@ static bool gpu_make(const char* path) {
 static u64 gpu_span(void) {
   size_t span = 0;
   cuDeviceTotalMem(&span, gpu_dev);
+#if BEND_HIP
+  if (gpu_host) {
+    return span < (2ull << 30) ? span : 2ull << 30;
+  }
+#endif
   return span;
 }
 

@@ -36,6 +36,7 @@ const VERSION = "2.0.36";
 const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
   ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs or BendTT by extension"],
+  ["bend <file.bend> -o <bin> --hip", "build a binary whose ! runs on a ROCm GPU"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
   ["bend <file.bend> --publish [<name>@<version>]", "publish the file and its imports; a name needs login"],
@@ -239,6 +240,7 @@ async function cli_file(args: string[]): Promise<void> {
   let verdict = false;
   let checkup = false;
   let publish = false;
+  let hip = false;
   let named: string | undefined;
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
@@ -257,6 +259,8 @@ async function cli_file(args: string[]): Promise<void> {
         named = args[i];
         named_parts(named);
       }
+    } else if (a === "--hip") {
+      hip = true;
     } else if (a === "-o") {
       i += 1;
       outs.push(args[i] ?? cli_fail("-o needs an output file"));
@@ -275,7 +279,7 @@ async function cli_file(args: string[]): Promise<void> {
     process.exit(1);
   }
   if (file.endsWith(".html") && (outs.length !== 1 || only || verdict
-    || checkup || publish || argv.length !== 0)) {
+    || checkup || publish || hip || argv.length !== 0)) {
     cli_fail("a page bundles with -o <dir>");
   }
   if (publish && (outs.length !== 0 || only || verdict || checkup)) {
@@ -287,6 +291,10 @@ async function cli_file(args: string[]): Promise<void> {
   // args go to a plain run only: any option (all start with -) refuses them
   if (argv.length !== 0 && args.some((a) => a.startsWith("-") && a !== "--")) {
     cli_fail("arguments go to a run: bend <file.bend> [args]");
+  }
+  if (hip && (outs.length === 0
+    || outs.some((o) => /\.(c|js|mjs|bendtt)$/.test(o)))) {
+    cli_fail("--hip builds a binary: bend <file.bend> -o <bin> --hip");
   }
   if (checkup && outs.length !== 0) {
     cli_fail("--checkup takes no -o: a binary holds one main, so build each"
@@ -319,7 +327,7 @@ async function cli_file(args: string[]): Promise<void> {
       if (ins.has(at) || (fs.existsSync(at) && fs.statSync(at).isDirectory())) {
         cli_fail("-o " + out + " is a file the program reads, or a directory");
       }
-      cli_emit(book, out);
+      cli_emit(book, out, hip);
     }
   } catch (e) {
     cli_say(2, book_err(e) + "\n");
@@ -370,7 +378,7 @@ function path_real(p: string): string {
   return fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p);
 }
 
-function cli_emit(book: Bend.Book, out: string): void {
+function cli_emit(book: Bend.Book, out: string, hip = false): void {
   if (out.endsWith(".mjs")) {
     fs.writeFileSync(out, Comp.js_lib(book, true));
   } else if (/\.c?js$/.test(out)) {
@@ -388,7 +396,7 @@ function cli_emit(book: Bend.Book, out: string): void {
       const c = path.join(dir, path.basename(out) + ".c");
       fs.writeFileSync(c, Comp.compile_book(book));
       Bun.gc(true);
-      cli_build(out, c);
+      cli_build(out, c, hip);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -433,16 +441,22 @@ function cc_find(gpu: boolean): string {
 // builds with the GPU lane and writes its GPU program too (on Linux only with
 // CUDA at the first of $CUDA_HOME, $CUDA_PATH, /usr/local/cuda and /opt/cuda
 // (Arch's) that holds nvrtc.h, its libraries in lib64 or, as nix lays them,
-// lib; else the ! runs on the cores). On macOS a program with a framework
-// (#import: a window, audio) builds as Objective-C; on Linux it links the X11
-// (plus libdl, for dlopen before glibc 2.34) and ALSA libraries it includes.
-function cli_build(bin: string, file: string): void {
+// lib; else the ! runs on the cores). With --hip the lane is HIP/ROCm, at
+// $ROCM_PATH or /opt/rocm, whichever holds include/hip/hiprtc.h. On macOS a
+// program with a framework (#import: a window, audio) builds as Objective-C;
+// on Linux it links the X11 (plus libdl, for dlopen before glibc 2.34) and
+// ALSA libraries it includes.
+function cli_build(bin: string, file: string, hip = false): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
   const cuda  = [process.env.CUDA_HOME, process.env.CUDA_PATH,
     "/usr/local/cuda", "/opt/cuda"]
     .find(d => d && fs.existsSync(d + "/include/nvrtc.h")) ?? "";
-  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || cuda !== "");
+  const rocm  = !hip ? "" : [process.env.ROCM_PATH, "/opt/rocm"]
+    .find(d => d && fs.existsSync(d + "/include/hip/hiprtc.h"))
+    ?? (() => { throw "Error: --hip needs ROCm ($ROCM_PATH or /opt/rocm"
+      + " with include/hip/hiprtc.h)"; })();
+  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || cuda !== "" || hip);
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
@@ -450,7 +464,10 @@ function cli_build(bin: string, file: string): void {
     !mac && c.includes("#include <" + h + "/") ? ls.map((l) => "-l" + l) : []);
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", path.resolve(bin)];
-  const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
+  const gpu = hip ? ["-DBEND_CUDA=1", "-DBEND_HIP=1", "-D__HIP_PLATFORM_AMD__=1",
+      "-I" + rocm + "/include", "-L" + rocm + "/lib", "-Wl,-rpath," + rocm
+      + "/lib", ...cpu, "-lamdhip64", "-lhiprtc"]
+    : mac ? ["-DBEND_METAL=1", ...cpu]
     : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
       "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs

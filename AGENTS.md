@@ -9,7 +9,9 @@ prelude; main.ts is the CLI. Every test is a Bend file that ends in the `#|`
 lines its run must print, and the gates run on the mini cluster.
 
     bend2/bend.ts       the language: parser, theory, checker
-    bend2/comp.ts       the compiler and the runtimes (C, Metal, CUDA, JS)
+    bend2/comp.ts       the compiler and the runtimes (C, Metal, CUDA, HIP, JS)
+    bend2/hip.h         the CUDA driver and NVRTC names over HIP and hipRTC,
+                        for --hip (AMD, ROCm)
     bend2/main.ts       the CLI; imported, the .bend loader for bun and node
     bend2/safe.ts       --verdict and -o <out>.bendtt: the elaborator from a
                         checked book to BendTT text
