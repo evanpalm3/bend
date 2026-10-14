@@ -4960,10 +4960,19 @@ static const char* gpu_probe(void) {
 #if BEND_HIP
   // XNACK on (an APU's default) hung the kernel on gfx902; off unless
   // the user sets HSA_XNACK
+  bool xnack = getenv("HSA_XNACK") == NULL;
   setenv("HSA_XNACK", "0", 0);
 #endif
   GPU_CHECK(cuInit, 0);
   GPU_CHECK(cuDeviceGet, &gpu_dev, 0);
+#if BEND_HIP
+  // a host that started HIP first left it on: refuse rather than hang
+  hipDeviceProp_t prop;
+  if (xnack && hipGetDeviceProperties(&prop, gpu_dev) == hipSuccess
+    && strstr(prop.gcnArchName, "xnack+") != NULL) {
+    return "HIP started with XNACK on, which can hang: set HSA_XNACK=0";
+  }
+#endif
   GPU_CHECK(cuDeviceGetAttribute, &managed,
     CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS, gpu_dev);
   if (managed == 0) {
